@@ -22,9 +22,12 @@ from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
 from accelerate.utils import set_seed
 from latentsync.whisper.audio2feature import Audio2Feature
 from DeepCache import DeepCacheSDHelper
+import cProfile
+import pstats
 
 
 def main(config, args):
+
     if not os.path.exists(args.video_path):
         raise RuntimeError(f"Video path '{args.video_path}' not found")
     if not os.path.exists(args.audio_path):
@@ -86,6 +89,9 @@ def main(config, args):
 
     print(f"Initial seed: {torch.initial_seed()}")
 
+    profiler = cProfile.Profile()
+    profiler.enable()
+
     pipeline(
         video_path=args.video_path,
         audio_path=args.audio_path,
@@ -99,6 +105,9 @@ def main(config, args):
         mask_image_path=config.data.mask_image_path,
         temp_dir=args.temp_dir,
     )
+    profiler.disable()
+    stats = pstats.Stats(profiler).sort_stats('cumtime')
+    stats.dump_stats('inference_profile.prof')
 
 
 if __name__ == "__main__":
