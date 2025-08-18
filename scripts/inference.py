@@ -22,6 +22,9 @@ from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
 from accelerate.utils import set_seed
 from latentsync.whisper.audio2feature import Audio2Feature
 from DeepCache import DeepCacheSDHelper
+import cProfile
+import pstats
+import datetime
 
 
 def main(config, args):
@@ -72,7 +75,7 @@ def main(config, args):
         unet=unet,
         scheduler=scheduler,
     ).to("cuda")
-
+    
     # use DeepCache
     if args.enable_deepcache:
         helper = DeepCacheSDHelper(pipe=pipeline)
@@ -86,6 +89,9 @@ def main(config, args):
 
     print(f"Initial seed: {torch.initial_seed()}")
 
+    profiler = cProfile.Profile()
+    profiler.enable()
+
     pipeline(
         video_path=args.video_path,
         audio_path=args.audio_path,
@@ -98,8 +104,13 @@ def main(config, args):
         height=config.data.resolution,
         mask_image_path=config.data.mask_image_path,
         temp_dir=args.temp_dir,
+        enable_profiling=True,
+        batch_size=args.batch_size
     )
-
+    profiler.disable()
+    dt_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    stats = pstats.Stats(profiler).sort_stats('cumtime')
+    stats.dump_stats(f'inference_profile_{dt_str}.prof')
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -113,6 +124,7 @@ if __name__ == "__main__":
     parser.add_argument("--temp_dir", type=str, default="temp")
     parser.add_argument("--seed", type=int, default=1247)
     parser.add_argument("--enable_deepcache", action="store_true")
+    parser.add_argument("--batch_size", type=int, default=1)
     args = parser.parse_args()
 
     config = OmegaConf.load(args.unet_config_path)

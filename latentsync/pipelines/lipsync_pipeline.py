@@ -1,6 +1,8 @@
 # Adapted from https://github.com/guoyww/AnimateDiff/blob/main/animatediff/pipelines/pipeline_animation.py
 
 import inspect
+import time
+import datetime
 import math
 import os
 import shutil
@@ -309,6 +311,24 @@ class LipsyncPipeline(DiffusionPipeline):
 
         return video_frames, faces, boxes, affine_matrices
 
+
+    def denoising_loop(self):
+        return
+    
+    def preprocessing_image(self):
+        return
+
+    def start_denoising(self, num_inferences):
+        batch_size = 1  # Process multiple chunks at once, adjust based on GPU memory
+        
+        # Create custom range: process pairs, then remaining singles
+        batch_indices = list(range(0, num_inferences, batch_size))
+        # Add remaining single indices
+        if batch_size > 1:
+            batch_indices.append(num_inferences - 1)
+        
+        return
+
     @torch.no_grad()
     def __call__(
         self,
@@ -329,6 +349,7 @@ class LipsyncPipeline(DiffusionPipeline):
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
+        batch_size: int = 1,
         **kwargs,
     ):
         is_train = self.unet.training
@@ -357,6 +378,7 @@ class LipsyncPipeline(DiffusionPipeline):
         # 3. set timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
+        timesteps_cpu = timesteps.cpu().numpy()
 
         # 4. Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -383,7 +405,184 @@ class LipsyncPipeline(DiffusionPipeline):
             device,
             generator,
         )
+        
+        num_inferences = math.ceil(len(whisper_chunks) / num_frames)
 
+        # Create custom range: process pairs, then remaining singles
+        batch_indices = list(range(0, num_inferences, batch_size))
+        # Add remaining single indices
+        if batch_size > 1:
+            batch_indices.append(num_inferences - 1)
+
+        for batch_start in tqdm.tqdm(batch_indices, desc="Doing batched inference..."):
+            # Determine if this is a single chunk (last iterations) or batched
+            if batch_start == num_inferences - 1:
+                # Single chunk processing
+                batch_end = batch_start + 1
+            elif batch_start == num_inferences - batch_size:
+                # Reduced chunk processing
+                batch_end = batch_start + (num_inferences - 1) % batch_size
+            else:
+                # Normal batch processing
+                batch_end = batch_start + batch_size
+                
+            print(f"Processing batch from {batch_start} to {batch_end - 1} (total {num_inferences} inferences)")
+    
+            # Collect data for all chunks in this batch
+            batch_audio_embeds = []
+            batch_mask_latents = []
+            batch_masked_image_latents = []
+            batch_ref_latents = []
+            batch_latents = []
+            batch_ref_pixel_values = []
+            batch_masks = []
+                
+            for i in range(batch_start, batch_end):
+                # Audio embeddings
+                if self.unet.add_audio_layer:
+                    # conditional audio embeddings
+                    audio_embeds = torch.stack(whisper_chunks[i * num_frames : (i + 1) * num_frames])
+                    audio_embeds = audio_embeds.to(device, dtype=weight_dtype)
+                    audio_embeds = audio_embeds.unsqueeze_(0) # (1, f, 50, 384)
+                    if do_classifier_free_guidance: 
+                        null_audio_embeds = torch.zeros_like(audio_embeds) # unconditional audio embeddings
+                        audio_embeds = torch.cat([null_audio_embeds, audio_embeds], dim=0) # (2, f, 50, 384)
+                        
+                    batch_audio_embeds.append(audio_embeds)
+                    
+                # Faces and latents for this chunk
+                inference_faces = faces[i * num_frames : (i + 1) * num_frames] # (f, c, h, w) 
+                latents = all_latents[:, :, i * num_frames : (i + 1) * num_frames] # (1, 4, 16, 64, 64)
+            
+                
+                # Prepare masks and images for this chunk
+                ref_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
+                    inference_faces, affine_transform=False
+                )
+
+
+                # 7. Prepare mask latent variables
+                mask_latents, masked_image_latents = self.prepare_mask_latents(
+                    masks,
+                    masked_pixel_values,
+                    height,
+                    width,
+                    weight_dtype,
+                    device,
+                    generator,
+                    do_classifier_free_guidance,
+                )
+
+                # 8. Prepare image latents
+                ref_latents = self.prepare_image_latents(
+                    ref_pixel_values,
+                    device,
+                    weight_dtype,
+                    generator,
+                    do_classifier_free_guidance,
+                )
+            
+                batch_latents.append(latents) # (1, 4, 16, 64, 64)
+                batch_mask_latents.append(mask_latents) # (2, 1, 16, 64, 64)
+                batch_masked_image_latents.append(masked_image_latents) # (2, 4, 16, 64, 64)
+                batch_ref_latents.append(ref_latents) # (2, 4, 16, 64, 64)
+                batch_masks.append(masks)
+                batch_ref_pixel_values.append(ref_pixel_values)
+                # Why mask_latents (2, 1, 16, 64, 64)? Where does the 2 come from?
+                # Are we just preparing for the classifier free guidance? YES: probably this is where batching becomes tricky
+                # All of the are just copied, i.e., mask_latents[0] and mask_latents[1] and so on, are the same
+                # Latents will be copied later as well
+
+            # Stack all tensors for batched processing
+            if self.unet.add_audio_layer and batch_audio_embeds:
+                batch_audio_embeds = torch.cat(batch_audio_embeds, dim=0)
+            else:
+                batch_audio_embeds = None
+            
+            batch_latents = torch.cat(batch_latents, dim=0)
+            batch_mask_latents = torch.cat(batch_mask_latents, dim=0)
+            batch_masked_image_latents = torch.cat(batch_masked_image_latents, dim=0)
+            batch_ref_latents = torch.cat(batch_ref_latents, dim=0)
+
+            # 9. Denoising loop
+            num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+            with self.progress_bar(total=num_inference_steps) as progress_bar:
+                for j, t in enumerate(timesteps):
+                    # expand the latents if we are doing classifier free guidance
+                    if do_classifier_free_guidance:
+                        unet_input = torch.cat([batch_latents] * 2)
+                        unet_input[0::2] = batch_latents  # uncond
+                        unet_input[1::2] = batch_latents  # cond
+                    else:
+                        unet_input = batch_latents
+
+                    unet_input = self.scheduler.scale_model_input(unet_input, t)
+
+                    # concat latents, mask, masked_image_latents in the channel dimension
+                    unet_input = torch.cat([unet_input, batch_mask_latents, batch_masked_image_latents, batch_ref_latents], dim=1) # (B * 2, 13, 16, 64, 64)
+
+                    # predict the noise residual
+                    noise_pred = self.unet(unet_input, t, encoder_hidden_states=batch_audio_embeds)[0] # (B * 2, 4, 16, 64, 64)
+
+                    # perform guidance
+                    if do_classifier_free_guidance:
+                        # The audio_embeddings are concatenated in an alternating order, i.e., for the first frame we have the unconditional audio embedding, 
+                        # and then the conditional audio embedding, and only then starts the second frame with the unconditional audio embedding, etc.
+                        noise_pred_uncond, noise_pred_audio = noise_pred[0::2], noise_pred[1::2]
+                        # noise_pred_uncond, noise_pred_audio = noise_pred.chunk(2)
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_audio - noise_pred_uncond) # (B, 4, 16, 64, 64)
+                    
+                    # compute the previous noisy sample x_t -> x_t-1
+                    batch_latents = self.scheduler.step(noise_pred, t, batch_latents, **extra_step_kwargs)[0]
+
+                    # call the callback, if provided
+                    if j == len(timesteps) - 1 or ((j + 1) > num_warmup_steps and (j + 1) % self.scheduler.order == 0):
+                        progress_bar.update()
+                        if callback is not None and j % callback_steps == 0:
+                            callback(j, t, latents)
+
+            # Split batch results back into individual chunks
+            for i, chunk_idx in enumerate(range(batch_start, batch_end)):
+                # start_frame = i * num_frames
+                # end_frame = (i + 1) * num_frames
+                chunk_latents = batch_latents[i]
+                chunk_latents = chunk_latents.unsqueeze(0)
+                # Decode and process this chunk's results
+                # (existing post-processing code for individual chunks)
+                decoded_latents = self.decode_latents(chunk_latents)
+                decoded_latents = self.paste_surrounding_pixels_back(
+                    decoded_latents, batch_ref_pixel_values[i].unsqueeze(0), 1 - batch_masks[i].unsqueeze(0), device, weight_dtype
+                ).squeeze(0)
+                synced_video_frames.append(decoded_latents)
+
+        synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices)
+
+        audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
+        audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()
+
+        if is_train:
+            self.unet.train()
+
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        os.makedirs(temp_dir, exist_ok=True)
+
+        dt_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        write_video(os.path.join(temp_dir, f"video_{dt_str}.mp4"), synced_video_frames, fps=video_fps)
+
+        sf.write(os.path.join(temp_dir, f"audio_{dt_str}.wav"), audio_samples, audio_sample_rate)
+
+        video_out_path = video_out_path[:-4] + f"_{dt_str}.mp4"
+        
+        command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, f'video_{dt_str}.mp4')} -i {os.path.join(temp_dir, f'audio_{dt_str}.wav')} -c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
+        subprocess.run(command, shell=True)
+
+
+    def denoising_loop_single_batches(self, whisper_chunks, num_frames, device, weight_dtype, generator, 
+                                      do_classifier_free_guidance, faces, all_latents, height, width,
+                                      timesteps, num_inference_steps, guidance_scale, timesteps_cpu,
+                                      callback, synced_video_frames, callback_steps, **extra_step_kwargs):
         num_inferences = math.ceil(len(whisper_chunks) / num_frames)
         for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
             if self.unet.add_audio_layer:
@@ -427,20 +626,22 @@ class LipsyncPipeline(DiffusionPipeline):
                 for j, t in enumerate(timesteps):
                     # expand the latents if we are doing classifier free guidance
                     unet_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-
                     unet_input = self.scheduler.scale_model_input(unet_input, t)
 
                     # concat latents, mask, masked_image_latents in the channel dimension
                     unet_input = torch.cat([unet_input, mask_latents, masked_image_latents, ref_latents], dim=1)
 
                     # predict the noise residual
-                    noise_pred = self.unet(unet_input, t, encoder_hidden_states=audio_embeds).sample
+                    noise_pred = self.unet(unet_input, j, t, encoder_hidden_states=audio_embeds).sample
 
                     # perform guidance
                     if do_classifier_free_guidance:
                         noise_pred_uncond, noise_pred_audio = noise_pred.chunk(2)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_audio - noise_pred_uncond)
 
+                    # t = item(t)
+                    t = timesteps_cpu[j]
+                    
                     # compute the previous noisy sample x_t -> x_t-1
                     latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
@@ -455,23 +656,8 @@ class LipsyncPipeline(DiffusionPipeline):
             decoded_latents = self.paste_surrounding_pixels_back(
                 decoded_latents, ref_pixel_values, 1 - masks, device, weight_dtype
             )
+
             synced_video_frames.append(decoded_latents)
 
-        synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices)
-
-        audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
-        audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()
-
-        if is_train:
-            self.unet.train()
-
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-        os.makedirs(temp_dir, exist_ok=True)
-
-        write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=video_fps)
-
-        sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
-
-        command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
-        subprocess.run(command, shell=True)
+def item(tensor):
+    return tensor.item()

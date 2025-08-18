@@ -8,4 +8,5 @@ python -m scripts.inference \
     --enable_deepcache \
     --video_path "assets/demo1_video.mp4" \
     --audio_path "assets/demo1_audio.wav" \
-    --video_out_path "video_out.mp4"
+    --video_out_path "video_out.mp4" \
+    --batch_size 1
