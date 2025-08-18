@@ -9,6 +9,15 @@
 
 </div>
 
+## Performance Optimization
+
+The setup is done as described below with running setup.sh.
+
+The file inference_profile_starting_point.prof shows the performance at the beginning. It can be visualized, e.g., with snakeviz (pip install snakeviz).
+
+The main optimization is the possibility to use batches, more detailed explanations are given in the PDF.
+
+
 ## 🔥 Updates
 
 - `2025/06/11`: We released **LatentSync 1.6**, which is trained on 512 $\times$ 512 resolution videos to mitigate the blurriness problem. Watch the demo [here](docs/changelog_v1.6.md).
